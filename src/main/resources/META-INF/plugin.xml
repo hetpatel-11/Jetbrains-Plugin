@@ -1,0 +1,16 @@
+<idea-plugin>
+    <id>com.hetpatel.pluginsandbox</id>
+    <name>Plugin Sandbox</name>
+    <vendor>Het Patel</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+                id="Plugin Sandbox"
+                anchor="right"
+                canCloseContent="false"
+                factoryClass="com.hetpatel.pluginsandbox.ui.PluginSandboxToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
+
