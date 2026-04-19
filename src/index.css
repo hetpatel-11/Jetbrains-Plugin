@@ -1,0 +1,73 @@
+:root {
+  --bg: #f5ede5;
+  --panel: rgba(255, 252, 247, 0.88);
+  --canvas: #f8efe7;
+  --button: rgba(255, 255, 255, 0.82);
+  --text: #6d6158;
+  --text-soft: #74675d;
+  --text-strong: #1f1a17;
+  --border: rgba(98, 77, 63, 0.16);
+  --accent: #d9481d;
+  --accent-strong: #9f3313;
+  --shadow:
+    0 22px 50px rgba(105, 69, 46, 0.09),
+    0 4px 16px rgba(105, 69, 46, 0.08);
+  --sans:
+    'Instrument Sans', 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+  --mono:
+    'SF Mono', 'JetBrains Mono', 'Cascadia Code', 'Menlo', monospace;
+
+  font-family: var(--sans);
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(244, 158, 76, 0.2), transparent 22%),
+    linear-gradient(180deg, #f5ede5 0%, #f8f3ec 100%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+body,
+button,
+textarea {
+  font-family: var(--sans);
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+p {
+  margin: 0;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+}
+
+#root {
+  min-height: 100vh;
+}
