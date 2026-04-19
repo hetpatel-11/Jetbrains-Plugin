@@ -40,6 +40,7 @@ declare global {
       onStateUpdate: (cb: (state: GuidanceState) => void) => () => void
       setInteractive: (interactive: boolean) => void
       getScreenSize: () => Promise<{ width: number; height: number }>
+      getState: () => Promise<GuidanceState>
       confirmClick: (confirmed: boolean) => void
     }
   }
@@ -65,15 +66,22 @@ export default function App() {
   // Subscribe to agent state updates from main process
   useEffect(() => {
     if (!window.electronAPI) return
+    void window.electronAPI.getState().then((s) => {
+      setState(s)
+      if (s.pins.length > 0) {
+        setActivePinId((current) => current ?? s.pins[0].id)
+      }
+    })
+
     const unsub = window.electronAPI.onStateUpdate((s) => {
       setState(s)
       // Auto-activate the first pin when agent pushes new ones
-      if (s.pins.length > 0 && !activePinId) {
-        setActivePinId(s.pins[0].id)
+      if (s.pins.length > 0) {
+        setActivePinId((current) => current ?? s.pins[0].id)
       }
     })
     return unsub
-  }, [activePinId])
+  }, [])
 
   // Track cursor position for coordinate picker mode
   useEffect(() => {

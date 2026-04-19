@@ -14,6 +14,11 @@ export interface GuidanceState {
   message: string | null
   step: number | null
   totalSteps: number | null
+  cursor: {
+    x: number
+    y: number
+    reason: string
+  } | null
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -31,6 +36,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   /** Get primary display dimensions */
   getScreenSize: (): Promise<{ width: number; height: number }> => {
     return ipcRenderer.invoke('get-screen-size')
+  },
+
+  /** Fetch the latest overlay state in case the renderer loaded after a state update */
+  getState: (): Promise<GuidanceState> => {
+    return ipcRenderer.invoke('get-state')
   },
 
   /** Send user's confirm/deny response for a pending click */

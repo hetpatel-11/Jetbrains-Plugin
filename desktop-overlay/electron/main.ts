@@ -109,6 +109,13 @@ function createWindow() {
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
+
+  // The renderer can miss early state updates during startup. Always send the
+  // latest overlay state once the page is ready so the cursor/pins render even
+  // if the agent already issued guidance commands.
+  mainWindow.webContents.on('did-finish-load', () => {
+    pushState()
+  })
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -122,6 +129,8 @@ ipcMain.handle('get-screen-size', () => {
   const { width, height } = screen.getPrimaryDisplay().bounds
   return { width, height }
 })
+
+ipcMain.handle('get-state', () => state)
 
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
