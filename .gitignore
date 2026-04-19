@@ -1,5 +1,8 @@
 .gradle/
 .idea/
 .intellijPlatform/
-build/
+build/*
+!build/distributions/
+build/distributions/*
+!build/distributions/Plugin-Jetbrains-*.zip
 out/
