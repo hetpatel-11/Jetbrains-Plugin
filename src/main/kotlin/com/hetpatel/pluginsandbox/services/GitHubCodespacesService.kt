@@ -5,13 +5,17 @@ import com.google.gson.JsonObject
 import com.hetpatel.pluginsandbox.model.Recommendation
 import com.hetpatel.pluginsandbox.model.RecommendationKind
 import com.hetpatel.pluginsandbox.model.SandboxConfig
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
 
 class GitHubCodespacesService(
+    private val repoRoot: Path? = null,
     private val commandRunner: CommandRunner = CommandRunner(),
 ) {
     private val gson = Gson()
+    private val launcherRepositorySlug: String by lazy { detectLauncherRepository() }
 
     fun ensureCodespace(
         config: SandboxConfig,
@@ -20,9 +24,13 @@ class GitHubCodespacesService(
     ): CodespaceDetails {
         validateAuth(onLog)
 
-        val repoFullName = recommendation.repositorySlug
+        val repoFullName = launcherRepositorySlug
+        val displayPrefix = buildDisplayPrefix(recommendation)
+        val branchToUse = resolveBranch(repoFullName, config.branch, onLog)
+        val machineToUse = resolveMachine(repoFullName, branchToUse, config.machine, onLog)
         val existing = listCodespaces(repoFullName)
-            .filter { config.branch.isBlank() || it.branch.equals(config.branch, ignoreCase = true) || it.branch.isBlank() }
+            .filter { it.displayName.startsWith(displayPrefix) }
+            .filter { branchToUse.isBlank() || it.branch.equals(branchToUse, ignoreCase = true) || it.branch.isBlank() }
             .sortedByDescending { it.lastUsedAt.ifBlank { it.createdAt } }
             .firstOrNull()
 
@@ -34,20 +42,42 @@ class GitHubCodespacesService(
             existing.name
         } else {
             val displayName = buildDisplayName(recommendation)
-            onLog("Creating a codespace for $repoFullName${if (config.branch.isNotBlank()) " on branch ${config.branch}" else ""}.")
-            createCodespace(repoFullName, config, displayName).ensureSuccess("Failed to create a codespace.")
+            onLog(
+                "Creating a launcher codespace for $repoFullName${if (branchToUse.isNotBlank()) " on branch $branchToUse" else ""} to boot ${recommendation.repositorySlug}.",
+            )
+            createCodespace(repoFullName, config, branchToUse, machineToUse, displayName).ensureSuccess("Failed to create a codespace.")
             pollForCodespace(repoFullName, displayName, onLog)
         }
 
         val details = waitForAvailable(codespaceName, onLog)
-        val bootstrap = bootstrapRecommendation(details.name, details.repositoryName, recommendation)
-        if (bootstrap.combinedOutput().isNotBlank()) {
-            onLog(bootstrap.combinedOutput())
-        }
-
+        ensureLauncherWorkspace(details.name, recommendation, onLog)
         return details.copy(
-            bootstrapSummary = bootstrap.summary(recommendation.kind),
+            bootstrapSummary = "Launcher repo ${details.repositoryName} is ready. It auto-cloned ${recommendation.repositorySlug} into /workspaces/target, installed dependencies, and started the app on port 8000.",
         )
+    }
+
+    fun commandPreview(
+        config: SandboxConfig,
+        recommendation: Recommendation,
+    ): String {
+        return buildString {
+            append("gh codespace create -R ")
+            append(launcherRepositorySlug)
+            if (config.branch.isNotBlank()) {
+                append(" -b ")
+                append(config.branch)
+            }
+            if (config.devcontainerPath.isNotBlank()) {
+                append(" --devcontainer-path ")
+                append(config.devcontainerPath)
+            }
+            if (config.machine.isNotBlank()) {
+                append(" -m ")
+                append(config.machine)
+            }
+            append(" -d ")
+            append(buildDisplayName(recommendation))
+        }
     }
 
     fun runRemoteCommand(
@@ -55,15 +85,26 @@ class GitHubCodespacesService(
         command: String,
         timeout: Duration = Duration.ofMinutes(15),
     ): CommandResult {
-        return commandRunner.run(
-            listOf(
-                "gh", "codespace", "ssh",
-                "-c", codespaceName,
-                "--",
-                "bash", "-lc", command,
-            ),
-            timeout = timeout,
-        )
+        val sshConfig = Files.createTempFile("plugin-sandbox-codespace-", ".ssh")
+        return try {
+            val config = commandRunner.run(
+                listOf("gh", "codespace", "ssh", "-c", codespaceName, "--config"),
+                timeout = Duration.ofSeconds(30),
+            ).ensureSuccess("Failed to generate SSH config for codespace $codespaceName.")
+            Files.writeString(sshConfig, config.stdout)
+            val host = Regex("""(?m)^Host\s+(.+)$""").find(config.stdout)?.groupValues?.get(1)
+                ?: throw IllegalStateException("Failed to resolve SSH host alias for codespace $codespaceName.")
+            commandRunner.run(
+                listOf(
+                    "bash",
+                    "-lc",
+                    "ssh -F ${shellQuote(sshConfig.toString())} ${shellQuote(host)} bash -lc ${shellQuote(command)}",
+                ),
+                timeout = timeout,
+            )
+        } finally {
+            Files.deleteIfExists(sshConfig)
+        }
     }
 
     private fun validateAuth(onLog: (String) -> Unit) {
@@ -110,6 +151,8 @@ class GitHubCodespacesService(
     private fun createCodespace(
         repoFullName: String,
         config: SandboxConfig,
+        branch: String,
+        machine: String,
         displayName: String,
     ): CommandResult {
         val command = mutableListOf(
@@ -117,10 +160,12 @@ class GitHubCodespacesService(
             "-R", repoFullName,
             "-d", displayName,
             "--default-permissions",
-            "-s",
         )
-        if (config.branch.isNotBlank()) {
-            command += listOf("-b", config.branch)
+        if (branch.isNotBlank()) {
+            command += listOf("-b", branch)
+        }
+        if (machine.isNotBlank()) {
+            command += listOf("-m", machine)
         }
         if (config.devcontainerPath.isNotBlank()) {
             command += listOf("--devcontainer-path", config.devcontainerPath)
@@ -129,6 +174,101 @@ class GitHubCodespacesService(
             command += listOf("-m", config.machine)
         }
         return commandRunner.run(command, timeout = Duration.ofMinutes(20))
+    }
+
+    private fun resolveBranch(
+        repoFullName: String,
+        requestedBranch: String,
+        onLog: (String) -> Unit,
+    ): String {
+        if (requestedBranch.isBlank()) {
+            val defaultBranch = fetchDefaultBranch(repoFullName)
+            if (defaultBranch.isNotBlank()) {
+                onLog("Using default branch $defaultBranch for $repoFullName.")
+            }
+            return defaultBranch
+        }
+
+        if (branchExists(repoFullName, requestedBranch)) {
+            return requestedBranch
+        }
+
+        val defaultBranch = fetchDefaultBranch(repoFullName)
+        onLog("Branch $requestedBranch is invalid for $repoFullName. Falling back to default branch $defaultBranch.")
+        return defaultBranch
+    }
+
+    private fun resolveMachine(
+        repoFullName: String,
+        branch: String,
+        requestedMachine: String,
+        onLog: (String) -> Unit,
+    ): String {
+        if (requestedMachine.isNotBlank()) {
+            onLog("Using configured machine type $requestedMachine.")
+            return requestedMachine
+        }
+
+        val machine = fetchAvailableMachines(repoFullName, branch).firstOrNull().orEmpty()
+        if (machine.isNotBlank()) {
+            onLog("Using machine type $machine for $repoFullName.")
+        }
+        return machine
+    }
+
+    private fun branchExists(
+        repoFullName: String,
+        branch: String,
+    ): Boolean =
+        commandRunner.run(
+            listOf(
+                "gh", "api",
+                "-H", "Accept: application/vnd.github+json",
+                "-H", "X-GitHub-Api-Version: 2026-03-10",
+                "/repos/$repoFullName/branches/$branch",
+            ),
+            timeout = Duration.ofSeconds(20),
+        ).exitCode == 0
+
+    private fun fetchDefaultBranch(repoFullName: String): String {
+        val output = commandRunner.run(
+            listOf(
+                "gh", "repo", "view", repoFullName,
+                "--json", "defaultBranchRef",
+            ),
+            timeout = Duration.ofSeconds(20),
+        ).ensureSuccess("Failed to fetch the default branch for $repoFullName.")
+        val root = gson.fromJson(output.stdout, JsonObject::class.java)
+        return root.getAsJsonObject("defaultBranchRef")?.string("name").orEmpty()
+    }
+
+    private fun fetchAvailableMachines(
+        repoFullName: String,
+        branch: String,
+    ): List<String> {
+        val endpoint = buildString {
+            append("/repos/")
+            append(repoFullName)
+            append("/codespaces/machines")
+            if (branch.isNotBlank()) {
+                append("?ref=")
+                append(branch)
+            }
+        }
+        val output = commandRunner.run(
+            listOf(
+                "gh", "api",
+                "-H", "Accept: application/vnd.github+json",
+                "-H", "X-GitHub-Api-Version: 2026-03-10",
+                endpoint,
+            ),
+            timeout = Duration.ofSeconds(20),
+        ).ensureSuccess("Failed to fetch available machine types for $repoFullName.")
+        val root = gson.fromJson(output.stdout, JsonObject::class.java)
+        val machines = root.getAsJsonArray("machines") ?: com.google.gson.JsonArray()
+        return machines.mapNotNull { element ->
+            element.asJsonObject?.get("name")?.takeUnless { it.isJsonNull }?.asString
+        }
     }
 
     private fun startCodespace(
@@ -210,55 +350,215 @@ class GitHubCodespacesService(
         throw IllegalStateException("Codespace creation did not return a visible codespace in time.")
     }
 
-    private fun bootstrapRecommendation(
+    private fun ensureLauncherWorkspace(
         codespaceName: String,
-        repositoryName: String,
+        recommendation: Recommendation,
+        onLog: (String) -> Unit,
+    ) {
+        if (waitForLauncherWorkspace(codespaceName, onLog, attempts = 6)) {
+            return
+        }
+
+        onLog("Launcher startup did not complete automatically. Running fallback bootstrap commands inside $codespaceName.")
+        val bootstrap = bootstrapLauncherWorkspace(codespaceName, recommendation)
+        if (bootstrap.combinedOutput().isNotBlank()) {
+            onLog(bootstrap.combinedOutput())
+        }
+
+        if (waitForLauncherWorkspace(codespaceName, onLog, attempts = 12)) {
+            return
+        }
+        throw IllegalStateException("Launcher startup did not finish in time. /workspaces/target was not ready.")
+    }
+
+    private fun waitForLauncherWorkspace(
+        codespaceName: String,
+        onLog: (String) -> Unit,
+        attempts: Int,
+    ): Boolean {
+        repeat(attempts) { attempt ->
+            val result = runRemoteCommand(
+                codespaceName = codespaceName,
+                command = "test -d /workspaces/target/.git && test -e /workspaces/target",
+                timeout = Duration.ofSeconds(20),
+            )
+            if (result.exitCode == 0) {
+                onLog("Launcher workspace /workspaces/target is ready.")
+                return true
+            }
+            if (attempt < attempts - 1) {
+                onLog("Waiting for launcher startup to finish inside ${codespaceName}.")
+                Thread.sleep(5_000)
+            }
+        }
+        return false
+    }
+
+    private fun bootstrapLauncherWorkspace(
+        codespaceName: String,
         recommendation: Recommendation,
     ): CommandResult {
-        val workspace = "/workspaces/$repositoryName"
+        val targetDevcontainerJson = """
+            {
+              "name": "Ephemeral Sandbox Target",
+              "image": "mcr.microsoft.com/devcontainers/python:3.10",
+              "postCreateCommand": "pip install fastapi uvicorn git",
+              "postStartCommand": "bash .devcontainer/start.sh",
+              "forwardPorts": [8000],
+              "portsAttributes": {
+                "8000": {
+                  "label": "Sandbox App",
+                  "onAutoForward": "openBrowser"
+                }
+              }
+            }
+        """.trimIndent()
         val command = when (recommendation.kind) {
             RecommendationKind.FAST_API_SIDECAR -> """
                 set -e
-                cd ${shellQuote(workspace)}
-                mkdir -p .plugin-sandbox/fastapi-sidecar
-                cat > .plugin-sandbox/fastapi-sidecar/main.py <<'PY'
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-PY
-                cat > .plugin-sandbox/fastapi-sidecar/requirements.txt <<'REQ'
-fastapi
-uvicorn
-REQ
-                printf 'Created FastAPI sidecar scaffold at .plugin-sandbox/fastapi-sidecar\n'
+                rm -f /workspaces/Jetbrains-Plugin/devcontainer.txt
+                TARGET_REPO=${shellQuote(recommendation.repositoryUrl)}
+                TARGET_DIR=/workspaces/target
+                rm -rf "${'$'}TARGET_DIR"
+                git clone --depth 1 "${'$'}TARGET_REPO" "${'$'}TARGET_DIR"
+                rm -f "${'$'}TARGET_DIR/devcontainer.txt"
+                mkdir -p "${'$'}TARGET_DIR/.devcontainer"
+                cat > "${'$'}TARGET_DIR/.devcontainer/devcontainer.json" <<'JSON'
+                $targetDevcontainerJson
+                JSON
+                cat > "${'$'}TARGET_DIR/.devcontainer/start.sh" <<'SH'
+                #!/bin/bash
+                set -e
+                python -m pip install --upgrade pip
+                if [ -f requirements.txt ]; then
+                  pip install -r requirements.txt
+                else
+                  pip install fastapi uvicorn
+                fi
+                python -m uvicorn docs_src.body_updates.tutorial001_py310:app --host 0.0.0.0 --port 8000
+                SH
+                chmod +x "${'$'}TARGET_DIR/.devcontainer/start.sh"
+                cd "${'$'}TARGET_DIR"
+                if command -v lsof >/dev/null 2>&1; then
+                  pids="${'$'}(lsof -ti tcp:8000 || true)"
+                  if [ -n "${'$'}pids" ]; then
+                    kill ${'$'}pids >/dev/null 2>&1 || true
+                  fi
+                fi
+                nohup bash .devcontainer/start.sh >/tmp/plugin-sandbox-fastapi.log 2>&1 < /dev/null &
+                echo "Fallback bootstrap finished for FastAPI."
             """.trimIndent()
             RecommendationKind.DIRECT_IN_REPO -> """
                 set -e
-                cd ${shellQuote(workspace)}
-                git status --short || true
-                printf 'Direct in-repo sandbox attached to %s\n' ${shellQuote(workspace)}
+                rm -f /workspaces/Jetbrains-Plugin/devcontainer.txt
+                TARGET_REPO=${shellQuote(recommendation.repositoryUrl)}
+                TARGET_DIR=/workspaces/target
+                rm -rf "${'$'}TARGET_DIR"
+                git clone --depth 1 "${'$'}TARGET_REPO" "${'$'}TARGET_DIR"
+                rm -f "${'$'}TARGET_DIR/devcontainer.txt"
+                mkdir -p "${'$'}TARGET_DIR/.devcontainer"
+                cat > "${'$'}TARGET_DIR/.devcontainer/devcontainer.json" <<'JSON'
+                $targetDevcontainerJson
+                JSON
+                cat > "${'$'}TARGET_DIR/.devcontainer/start.sh" <<'SH'
+                #!/bin/bash
+                set -e
+                python -m pip install --upgrade pip
+                pip install -e .
+                pip install -e examples/tutorial
+                cd examples/tutorial
+                python -m flask --app flaskr init-db >/tmp/plugin-sandbox-flask-init.log 2>&1 || true
+                python -m flask --app flaskr run --host 0.0.0.0 --port 8000
+                SH
+                chmod +x "${'$'}TARGET_DIR/.devcontainer/start.sh"
+                cd "${'$'}TARGET_DIR"
+                if command -v lsof >/dev/null 2>&1; then
+                  pids="${'$'}(lsof -ti tcp:8000 || true)"
+                  if [ -n "${'$'}pids" ]; then
+                    kill ${'$'}pids >/dev/null 2>&1 || true
+                  fi
+                fi
+                nohup bash .devcontainer/start.sh >/tmp/plugin-sandbox-flask.log 2>&1 < /dev/null &
+                echo "Fallback bootstrap finished for Flask."
             """.trimIndent()
             RecommendationKind.ADAPTER_SANDBOX -> """
                 set -e
-                cd ${shellQuote(workspace)}
-                mkdir -p .plugin-sandbox/adapter-prototype
-                cat > .plugin-sandbox/adapter-prototype/README.md <<'MD'
-# Adapter Prototype
-
-Use this area to validate a boundary-first implementation before wiring it into the main modules.
-MD
-                printf 'Created adapter prototype scaffold at .plugin-sandbox/adapter-prototype\n'
+                rm -f /workspaces/Jetbrains-Plugin/devcontainer.txt
+                TARGET_REPO=${shellQuote(recommendation.repositoryUrl)}
+                TARGET_DIR=/workspaces/target
+                rm -rf "${'$'}TARGET_DIR"
+                git clone --depth 1 "${'$'}TARGET_REPO" "${'$'}TARGET_DIR"
+                rm -f "${'$'}TARGET_DIR/devcontainer.txt"
+                mkdir -p "${'$'}TARGET_DIR/.devcontainer"
+                cat > "${'$'}TARGET_DIR/.devcontainer/devcontainer.json" <<'JSON'
+                $targetDevcontainerJson
+                JSON
+                cat > "${'$'}TARGET_DIR/.devcontainer/start.sh" <<'SH'
+                #!/bin/bash
+                set -e
+                python -m pip install --upgrade pip
+                pip install -e .
+                TARGET_DIR="$(pwd)"
+                RUNTIME_DIR="${'$'}TARGET_DIR/.plugin-sandbox-runtime/django-demo"
+                mkdir -p "${'$'}RUNTIME_DIR"
+                if [ ! -f "${'$'}RUNTIME_DIR/manage.py" ]; then
+                  django-admin startproject sandbox_app "${'$'}RUNTIME_DIR"
+                fi
+                cd "${'$'}RUNTIME_DIR"
+                python manage.py migrate --noinput >/tmp/plugin-sandbox-django-migrate.log 2>&1
+                python manage.py runserver 0.0.0.0:8000
+                SH
+                chmod +x "${'$'}TARGET_DIR/.devcontainer/start.sh"
+                cd "${'$'}TARGET_DIR"
+                if command -v lsof >/dev/null 2>&1; then
+                  pids="${'$'}(lsof -ti tcp:8000 || true)"
+                  if [ -n "${'$'}pids" ]; then
+                    kill ${'$'}pids >/dev/null 2>&1 || true
+                  fi
+                fi
+                nohup bash .devcontainer/start.sh >/tmp/plugin-sandbox-django.log 2>&1 < /dev/null &
+                echo "Fallback bootstrap finished for Django."
             """.trimIndent()
         }
-        return runRemoteCommand(codespaceName, command, timeout = Duration.ofMinutes(5))
+        return runRemoteCommand(codespaceName, command, timeout = Duration.ofMinutes(10))
     }
 
+    private fun buildDisplayPrefix(recommendation: Recommendation): String =
+        when (recommendation.kind) {
+            RecommendationKind.FAST_API_SIDECAR -> "ps-fastapi"
+            RecommendationKind.DIRECT_IN_REPO -> "ps-flask"
+            RecommendationKind.ADAPTER_SANDBOX -> "ps-django"
+        }
+
     private fun buildDisplayName(recommendation: Recommendation): String =
-        "plugin-sandbox-${recommendation.kind.name.lowercase().replace('_', '-')}-${Instant.now().epochSecond}"
+        "${buildDisplayPrefix(recommendation)}-${Instant.now().epochSecond}"
+
+    private fun detectLauncherRepository(): String {
+        val root = repoRoot?.toAbsolutePath()?.toString() ?: "."
+        val remote = commandRunner.run(
+            listOf("git", "-C", root, "remote", "get-url", "origin"),
+            timeout = Duration.ofSeconds(10),
+        ).ensureSuccess("Failed to determine the launcher repository remote.")
+
+        val value = remote.stdout.trim()
+        parseRepositorySlug(value)?.let { return it }
+        throw IllegalStateException(
+            "The launcher repository remote `$value` is not a supported GitHub origin. Expected `owner/repo` on github.com.",
+        )
+    }
+
+    private fun parseRepositorySlug(remote: String): String? {
+        val normalized = remote.removeSuffix(".git")
+        val httpsMatch = Regex("""https://github\.com/([^/]+/[^/]+)$""").find(normalized)
+        if (httpsMatch != null) {
+            return httpsMatch.groupValues[1]
+        }
+        val sshMatch = Regex("""git@github\.com:([^/]+/[^/]+)$""").find(normalized)
+        if (sshMatch != null) {
+            return sshMatch.groupValues[1]
+        }
+        return null
+    }
 
     private fun JsonObject.string(key: String): String =
         get(key)?.takeUnless { it.isJsonNull }?.asString.orEmpty()
@@ -288,19 +588,6 @@ data class CodespaceDetails(
     val repositoryName: String,
     val bootstrapSummary: String,
 )
-
-private fun CommandResult.summary(kind: RecommendationKind): String {
-    val output = combinedOutput()
-    return if (output.isNotBlank()) {
-        output.lines().take(6).joinToString("\n")
-    } else {
-        when (kind) {
-            RecommendationKind.FAST_API_SIDECAR -> "FastAPI scaffold created in the codespace sandbox."
-            RecommendationKind.DIRECT_IN_REPO -> "In-repo sandbox attached without creating extra scaffolding."
-            RecommendationKind.ADAPTER_SANDBOX -> "Adapter prototype scaffold created in the codespace sandbox."
-        }
-    }
-}
 
 private fun shellQuote(value: String): String =
     "'" + value.replace("'", "'\"'\"'") + "'"

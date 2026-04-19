@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pluginSandbox": {
+      "command": "python3",
+      "args": [
+        "/var/folders/y5/9glm25ms7k7_dqgrb0fxf7n40000gn/T/plugin-sandbox-mcp/sandbox_bridge.py",
+        "--state-file",
+        "/Users/hetpatel/Desktop/Plugin-Jetbrains/Plugin-Jetbrains/.plugin-sandbox/mcp-state.json"
+      ]
+    }
+  }
+}

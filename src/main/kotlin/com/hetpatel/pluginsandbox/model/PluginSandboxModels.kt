@@ -3,6 +3,7 @@ package com.hetpatel.pluginsandbox.model
 data class PluginSandboxState(
     val prdText: String = "",
     val sandboxConfig: SandboxConfig = SandboxConfig(),
+    val mcpBridge: McpBridgeInfo = McpBridgeInfo(),
     val recommendations: List<Recommendation> = emptyList(),
     val selectedRecommendationId: String? = null,
     val sandboxSession: SandboxSession? = null,
@@ -10,6 +11,13 @@ data class PluginSandboxState(
     val generatedPrompt: String = "",
     val activityLog: List<String> = emptyList(),
     val lastError: String = "",
+)
+
+data class McpBridgeInfo(
+    val serverScriptPath: String = "",
+    val stateFilePath: String = "",
+    val configJson: String = "",
+    val status: String = "Launch `Try it out` to bind AI chat tools to a live sandbox.",
 )
 
 data class Recommendation(

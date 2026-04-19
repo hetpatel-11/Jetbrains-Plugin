@@ -1,5 +1,6 @@
 package com.hetpatel.pluginsandbox.services
 
+import com.hetpatel.pluginsandbox.model.Recommendation
 import com.hetpatel.pluginsandbox.model.ScanResult
 import com.hetpatel.pluginsandbox.model.ScanSeverity
 import com.intellij.openapi.Disposable
@@ -12,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class ScanOrchestrator(
     private val codespacesService: GitHubCodespacesService,
+    private val commandRunner: CommandRunner = CommandRunner(),
 ) : Disposable {
     private val executor = AppExecutorUtil.getAppExecutorService()
     private val generation = AtomicInteger(0)
@@ -19,39 +21,50 @@ class ScanOrchestrator(
 
     fun startScan(
         codespaceName: String,
-        repositoryName: String,
+        workspacePath: String,
+        recommendation: Recommendation,
         onUpdate: (List<ScanResult>) -> Unit,
         onLog: (String) -> Unit,
     ) {
         cancelCurrent()
         val runId = generation.incrementAndGet()
-        val scanSpecs = scanSpecs(repositoryName)
+        val scanSpecs = scanSpecs()
         publish(runId, scanSpecs.map { it.runningResult() }, onUpdate)
 
-        scanSpecs.forEachIndexed { index, spec ->
-            val task = executor.submit {
-                onLog("Running ${spec.toolName} in codespace $codespaceName.")
-                val result = runCatching {
-                    val commandResult = codespacesService.runRemoteCommand(
-                        codespaceName = codespaceName,
-                        command = spec.command,
-                        timeout = Duration.ofMinutes(15),
-                    )
-                    spec.interpret(commandResult)
-                }.getOrElse { error ->
-                    ScanResult(
-                        toolName = spec.toolName,
-                        statusLabel = "Failed",
-                        findings = error.message ?: "Unknown scan failure.",
-                        recommendation = "Inspect the scan command failure before trusting the sandbox result.",
-                        severity = ScanSeverity.HIGH_RISK,
-                    )
-                }
+        val scanTask = executor.submit {
+            val workspace = workspacePath
+            onLog("Running vulnerability checks inside codespace $codespaceName against ${recommendation.repositorySlug} in $workspace.")
 
-                publish(runId, updateAt(scanSpecs.map { it.runningResult() }, index, result), onUpdate)
+            val results = MutableList(scanSpecs.size) { index -> scanSpecs[index].runningResult() }
+            scanSpecs.forEachIndexed { index, spec ->
+                val task = executor.submit {
+                    val result = runCatching {
+                        onLog("Running ${spec.toolName} inside the sandbox against ${recommendation.repositorySlug}.")
+                        spec.interpret(
+                            codespacesService.runRemoteCommand(
+                                codespaceName = codespaceName,
+                                command = "cd ${shellQuote(workspace)} && ${spec.command}",
+                                timeout = Duration.ofMinutes(20),
+                            ),
+                        )
+                    }.getOrElse { error ->
+                        ScanResult(
+                            toolName = spec.toolName,
+                            statusLabel = "Failed",
+                            findings = error.message ?: "Unknown scan failure.",
+                            recommendation = "Inspect the scan failure before trusting the sandbox result.",
+                            severity = ScanSeverity.HIGH_RISK,
+                        )
+                    }
+                    synchronized(results) {
+                        results[index] = result
+                        publish(runId, results.toList(), onUpdate)
+                    }
+                }
+                runningTasks += task
             }
-            runningTasks += task
         }
+        runningTasks += scanTask
     }
 
     override fun dispose() {
@@ -79,95 +92,81 @@ class ScanOrchestrator(
         runningTasks.clear()
     }
 
-    private fun updateAt(
-        list: List<ScanResult>,
-        index: Int,
-        item: ScanResult,
-    ): List<ScanResult> = list.mapIndexed { currentIndex, current ->
-        if (currentIndex == index) item else current
-    }
-
-    private fun scanSpecs(repositoryName: String): List<ScanSpec> {
-        val workspace = "/workspaces/$repositoryName"
-        return listOf(
-            ScanSpec(
-                toolName = "gitleaks",
-                command = "cd '$workspace' && if command -v gitleaks >/dev/null 2>&1; then gitleaks detect --no-banner --source . --redact; else echo '__PLUGIN_UNAVAILABLE__'; fi",
-                parser = ::interpretGitleaks,
-            ),
-            ScanSpec(
-                toolName = "trivy fs",
-                command = "cd '$workspace' && if command -v trivy >/dev/null 2>&1; then trivy fs --quiet --severity MEDIUM,HIGH,CRITICAL .; else echo '__PLUGIN_UNAVAILABLE__'; fi",
-                parser = { interpretGeneral(it, "Dependency and filesystem vulnerabilities were reported.", "Review the vulnerable packages or config issues before promoting this sandbox path.") },
-            ),
-            ScanSpec(
-                toolName = "osv-scanner",
-                command = "cd '$workspace' && if command -v osv-scanner >/dev/null 2>&1; then osv-scanner -r .; else echo '__PLUGIN_UNAVAILABLE__'; fi",
-                parser = { interpretGeneral(it, "OSV advisories were reported for the current workspace.", "Upgrade or isolate affected packages before implementing the chosen approach.") },
-            ),
-            ScanSpec(
-                toolName = "heuristics",
-                command = "cd '$workspace' && if command -v rg >/dev/null 2>&1; then rg -n -e 'curl\\s+.*\\|\\s*sh' -e 'wget\\s+.*\\|\\s*sh' -e 'postinstall' -e 'eval\\(' -e 'process\\.env\\.[A-Z0-9_]{8,}' -g '!node_modules' -g '!dist' -g '!build' .; else echo '__PLUGIN_UNAVAILABLE__'; fi",
-                parser = ::interpretHeuristics,
-            ),
-            ScanSpec(
-                toolName = "package audit",
-                command = """
-                    cd '$workspace'
-                    if [ -f package.json ]; then
-                      if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
-                        pnpm audit --prod
-                      elif command -v npm >/dev/null 2>&1; then
-                        npm audit --omit=dev
-                      else
-                        echo '__PLUGIN_UNAVAILABLE__'
-                      fi
-                    else
-                      echo '__PLUGIN_NOT_APPLICABLE__'
-                    fi
-                """.trimIndent(),
-                parser = { interpretGeneral(it, "JavaScript dependency audit reported issues.", "Resolve the reported package vulnerabilities before implementing this recommendation.") },
-            ),
-            ScanSpec(
-                toolName = "python audit",
-                command = """
-                    cd '$workspace'
-                    if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
-                      if command -v pip-audit >/dev/null 2>&1; then
-                        pip-audit
-                      else
-                        echo '__PLUGIN_UNAVAILABLE__'
-                      fi
-                    else
-                      echo '__PLUGIN_NOT_APPLICABLE__'
-                    fi
-                """.trimIndent(),
-                parser = { interpretGeneral(it, "Python dependency audit reported issues.", "Fix the reported Python package vulnerabilities before promoting this path.") },
-            ),
-            ScanSpec(
-                toolName = "cargo audit",
-                command = """
-                    cd '$workspace'
-                    if [ -f Cargo.toml ]; then
-                      if command -v cargo-audit >/dev/null 2>&1; then
-                        cargo audit
-                      else
-                        echo '__PLUGIN_UNAVAILABLE__'
-                      fi
-                    else
-                      echo '__PLUGIN_NOT_APPLICABLE__'
-                    fi
-                """.trimIndent(),
-                parser = { interpretGeneral(it, "Rust dependency audit reported issues.", "Address the reported Rust advisories before implementing this path.") },
-            ),
-        )
-    }
+    private fun scanSpecs(): List<ScanSpec> = listOf(
+        ScanSpec(
+            toolName = "gitleaks",
+            command = "if command -v gitleaks >/dev/null 2>&1; then gitleaks detect --no-banner --source . --redact; else echo '__PLUGIN_UNAVAILABLE__'; fi",
+            parser = ::interpretGitleaks,
+        ),
+        ScanSpec(
+            toolName = "trivy fs",
+            command = "if command -v trivy >/dev/null 2>&1; then trivy fs --quiet --severity MEDIUM,HIGH,CRITICAL .; else echo '__PLUGIN_UNAVAILABLE__'; fi",
+            parser = { interpretGeneral(it, "Dependency and filesystem vulnerabilities were reported.", "Review the vulnerable packages or config issues before promoting this sandbox path.") },
+        ),
+        ScanSpec(
+            toolName = "osv-scanner",
+            command = "if command -v osv-scanner >/dev/null 2>&1; then osv-scanner -r .; else echo '__PLUGIN_UNAVAILABLE__'; fi",
+            parser = { interpretGeneral(it, "OSV advisories were reported for the current workspace.", "Upgrade or isolate affected packages before implementing the chosen approach.") },
+        ),
+        ScanSpec(
+            toolName = "heuristics",
+            command = "if command -v rg >/dev/null 2>&1; then rg -n -e 'curl\\s+.*\\|\\s*sh' -e 'wget\\s+.*\\|\\s*sh' -e 'postinstall' -e 'eval\\(' -e 'process\\.env\\.[A-Z0-9_]{8,}' -g '!node_modules' -g '!dist' -g '!build' .; else echo '__PLUGIN_UNAVAILABLE__'; fi",
+            parser = ::interpretHeuristics,
+        ),
+        ScanSpec(
+            toolName = "package audit",
+            command = """
+                if [ -f package.json ]; then
+                  if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
+                    pnpm audit --prod
+                  elif command -v npm >/dev/null 2>&1; then
+                    npm audit --omit=dev
+                  else
+                    echo '__PLUGIN_UNAVAILABLE__'
+                  fi
+                else
+                  echo '__PLUGIN_NOT_APPLICABLE__'
+                fi
+            """.trimIndent(),
+            parser = { interpretGeneral(it, "JavaScript dependency audit reported issues.", "Resolve the reported package vulnerabilities before implementing this recommendation.") },
+        ),
+        ScanSpec(
+            toolName = "python audit",
+            command = """
+                if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+                  if command -v pip-audit >/dev/null 2>&1; then
+                    pip-audit
+                  else
+                    echo '__PLUGIN_UNAVAILABLE__'
+                  fi
+                else
+                  echo '__PLUGIN_NOT_APPLICABLE__'
+                fi
+            """.trimIndent(),
+            parser = { interpretGeneral(it, "Python dependency audit reported issues.", "Fix the reported Python package vulnerabilities before promoting this path.") },
+        ),
+        ScanSpec(
+            toolName = "cargo audit",
+            command = """
+                if [ -f Cargo.toml ]; then
+                  if command -v cargo-audit >/dev/null 2>&1; then
+                    cargo audit
+                  else
+                    echo '__PLUGIN_UNAVAILABLE__'
+                  fi
+                else
+                  echo '__PLUGIN_NOT_APPLICABLE__'
+                fi
+            """.trimIndent(),
+            parser = { interpretGeneral(it, "Rust dependency audit reported issues.", "Address the reported Rust advisories before implementing this path.") },
+        ),
+    )
 
     private fun interpretGitleaks(result: CommandResult): ScanResult {
         val output = result.combinedOutput()
         return when {
             output.contains("__PLUGIN_UNAVAILABLE__") -> unavailable("gitleaks")
-            result.exitCode == 0 -> info("gitleaks", "No secrets detected in the codespace workspace.", "Proceed, but keep secrets out of tracked files.")
+            result.exitCode == 0 -> info("gitleaks", "No secrets detected in the local clone.", "Proceed, but keep secrets out of tracked files.")
             else -> ScanResult(
                 toolName = "gitleaks",
                 statusLabel = "High Risk",
@@ -227,8 +226,8 @@ class ScanOrchestrator(
         ScanResult(
             toolName = toolName,
             statusLabel = "Unavailable",
-            findings = "The scanner is not installed in the codespace image.",
-            recommendation = "Install the scanner in the devcontainer if this check is required for the workflow.",
+            findings = "The scanner is not installed in the sandbox environment.",
+            recommendation = "Install the scanner in the codespace if this check is required for the workflow.",
             severity = null,
         )
 
@@ -273,7 +272,7 @@ private data class ScanSpec(
     fun runningResult(): ScanResult = ScanResult(
         toolName = toolName,
         statusLabel = "Running",
-        findings = "Executing the scanner in the active codespace.",
+        findings = "Executing the scanner inside the sandbox.",
         recommendation = "Wait for the command to complete.",
         severity = null,
     )
@@ -284,3 +283,5 @@ private data class ScanSpec(
     }
 }
 
+private fun shellQuote(value: String): String =
+    "'" + value.replace("'", "'\"'\"'") + "'"

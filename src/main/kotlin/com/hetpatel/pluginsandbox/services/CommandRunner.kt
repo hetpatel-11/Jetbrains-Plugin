@@ -9,8 +9,12 @@ class CommandRunner {
     fun run(
         command: List<String>,
         timeout: Duration = Duration.ofMinutes(10),
+        environment: Map<String, String> = emptyMap(),
     ): CommandResult {
         val commandLine = GeneralCommandLine(command).withCharset(StandardCharsets.UTF_8)
+        if (environment.isNotEmpty()) {
+            commandLine.withEnvironment(environment)
+        }
         val output = CapturingProcessHandler(commandLine).runProcess(timeout.toMillis().toInt())
         return CommandResult(
             command = command,
@@ -48,4 +52,3 @@ data class CommandResult(
         return this
     }
 }
-

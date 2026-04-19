@@ -76,6 +76,14 @@ class PluginSandboxPanel(
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         alignmentX = LEFT_ALIGNMENT
     }
+    private val mcpStatusLabel = JBLabel("Launch `Try it out` to bind AI chat tools to a live sandbox.")
+    private val mcpConfigArea = JBTextArea().apply {
+        isEditable = false
+        lineWrap = true
+        wrapStyleWord = true
+        rows = 8
+        border = JBUI.Borders.empty(8)
+    }
     private val promptArea = JBTextArea().apply {
         isEditable = false
         lineWrap = true
@@ -97,6 +105,8 @@ class PluginSandboxPanel(
             add(section("Sandbox", buildSandboxSection()))
             add(Box.createVerticalStrut(12))
             add(section("Scan Status", scansPanel))
+            add(Box.createVerticalStrut(12))
+            add(section("AI MCP Bridge", buildMcpSection()))
             add(Box.createVerticalStrut(12))
             add(section("Implementation Prompt", buildPromptSection()))
         }
@@ -141,7 +151,7 @@ class PluginSandboxPanel(
             add(Box.createVerticalStrut(6))
             add(
                 JBLabel(
-                    "<html>The sandbox repo comes from the selected recommendation card. Branch/devcontainer/machine are optional overrides.</html>",
+                    "<html>`Try it out` creates a Codespace from this launcher repo. The selected recommendation determines which target repo the launcher clones into `/workspaces/target`. Branch/devcontainer/machine are launcher overrides.</html>",
                 ).apply {
                     foreground = JBColor.GRAY
                 },
@@ -157,7 +167,7 @@ class PluginSandboxPanel(
             add(JButton("Expand Sandbox").apply {
                 addActionListener {
                     if (browserUrl.isNotBlank()) {
-                        SandboxDialog(browserUrl).show()
+                        BrowserUtil.browse(browserUrl)
                     }
                 }
             })
@@ -200,10 +210,29 @@ class PluginSandboxPanel(
         }
     }
 
+    private fun buildMcpSection(): JPanel {
+        val copyConfigButton = JButton("Copy MCP Config").apply {
+            addActionListener {
+                if (mcpConfigArea.text.isNotBlank()) {
+                    CopyPasteManager.getInstance().setContents(StringSelection(mcpConfigArea.text))
+                    Toolkit.getDefaultToolkit().beep()
+                }
+            }
+        }
+
+        return JPanel(BorderLayout(0, 8)).apply {
+            alignmentX = LEFT_ALIGNMENT
+            add(mcpStatusLabel, BorderLayout.NORTH)
+            add(JBScrollPane(mcpConfigArea).apply { preferredSize = Dimension(0, 170) }, BorderLayout.CENTER)
+            add(copyConfigButton, BorderLayout.SOUTH)
+        }
+    }
+
     private fun render(state: PluginSandboxState) {
         renderRecommendations(state)
         renderSandbox(state)
         renderScans(state.scanResults)
+        renderMcpBridge(state)
         promptArea.text = state.generatedPrompt.ifBlank {
             "Select `Implement` on a recommendation after reviewing the sandbox and scan summary."
         }
@@ -283,6 +312,13 @@ class PluginSandboxPanel(
             scansPanel.add(createScanRow(result))
             scansPanel.add(Box.createVerticalStrut(8))
         }
+    }
+
+    private fun renderMcpBridge(state: PluginSandboxState) {
+        mcpStatusLabel.text =
+            "<html>${state.mcpBridge.status}<br><br>Paste this JSON into `Settings | Tools | AI Assistant | Model Context Protocol (MCP)` and AI chat will get sandbox tools bound to the active codespace.</html>"
+        mcpConfigArea.text = state.mcpBridge.configJson
+        mcpConfigArea.toolTipText = state.mcpBridge.stateFilePath
     }
 
     private fun createRecommendationCard(
@@ -455,6 +491,8 @@ class PluginSandboxPanel(
 
         val component: JComponent = when {
             url.isBlank() -> mutedLabel("The live Codespace UI will appear here after the sandbox becomes available.")
+            url.contains("github.com", ignoreCase = true) || url.contains("github.dev", ignoreCase = true) ->
+                mutedLabel("Embedded GitHub Codespaces is disabled in-plugin because the IDE browser does not share your normal GitHub session. Use `Expand Sandbox` to open it in your signed-in browser.")
             !JBCefApp.isSupported() -> mutedLabel("JCEF is unavailable in this IDE runtime, so the sandbox can’t be embedded here. Use the codespace URL externally.")
             else -> {
                 browser = JBCefBrowser(url)
@@ -465,26 +503,6 @@ class PluginSandboxPanel(
         sandboxBrowserPanel.revalidate()
         sandboxBrowserPanel.repaint()
     }
-
-    private inner class SandboxDialog(
-        private val url: String,
-    ) : DialogWrapper(true) {
-        init {
-            title = "Sandbox"
-            init()
-        }
-
-        override fun createCenterPanel(): JComponent {
-            return if (JBCefApp.isSupported()) {
-                JBCefBrowser(url).component.apply {
-                    preferredSize = Dimension(1440, 900)
-                }
-            } else {
-                mutedLabel("JCEF is unavailable in this IDE runtime.")
-            }
-        }
-    }
-
     private fun RiskLevel.displayName(): String = when (this) {
         RiskLevel.LOW -> "Low"
         RiskLevel.MEDIUM -> "Medium"

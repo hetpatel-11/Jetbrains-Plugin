@@ -7,28 +7,28 @@ import com.hetpatel.pluginsandbox.model.SandboxSession
 import com.hetpatel.pluginsandbox.model.SandboxStatus
 import com.hetpatel.pluginsandbox.services.GitHubCodespacesService
 import com.hetpatel.pluginsandbox.services.ImplementationPromptGenerator
+import com.hetpatel.pluginsandbox.services.McpBridgeManager
 import com.hetpatel.pluginsandbox.services.RecommendationEngine
 import com.hetpatel.pluginsandbox.services.ScanOrchestrator
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.util.concurrency.AppExecutorUtil
-import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Future
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
 
 class PluginSandboxController(
-    repoRoot: Path?,
+    repoRoot: java.nio.file.Path?,
 ) : Disposable {
     private val listeners = CopyOnWriteArrayList<(PluginSandboxState) -> Unit>()
     private val recommendationEngine = RecommendationEngine()
-    private val codespacesService = GitHubCodespacesService()
+    private val codespacesService = GitHubCodespacesService(repoRoot)
     private val scanOrchestrator = ScanOrchestrator(codespacesService)
+    private val mcpBridgeManager = McpBridgeManager(repoRoot)
     private val scheduler = AppExecutorUtil.getAppScheduledExecutorService()
-    private var sandboxReadyFuture: ScheduledFuture<*>? = null
     private var activeSandboxTask: Future<*>? = null
-    private var state = PluginSandboxState()
+    private var state = PluginSandboxState(
+        mcpBridge = mcpBridgeManager.info(),
+    )
 
     fun subscribe(listener: (PluginSandboxState) -> Unit) {
         listeners += listener
@@ -53,13 +53,13 @@ class PluginSandboxController(
 
     fun generateRecommendations() {
         val recommendations = recommendationEngine.generate(state.prdText)
-        sandboxReadyFuture?.cancel(false)
         activeSandboxTask?.cancel(true)
         setState(
             state.copy(
                 recommendations = recommendations,
                 selectedRecommendationId = null,
                 sandboxSession = null,
+                mcpBridge = mcpBridgeManager.info("Launch `Try it out` to bind AI chat tools to a live sandbox."),
                 scanResults = emptyList(),
                 generatedPrompt = "",
                 lastError = "",
@@ -69,7 +69,6 @@ class PluginSandboxController(
 
     fun tryRecommendation(recommendationId: String) {
         val recommendation = state.recommendations.firstOrNull { it.id == recommendationId } ?: return
-        sandboxReadyFuture?.cancel(false)
         activeSandboxTask?.cancel(true)
 
         setState(
@@ -79,8 +78,8 @@ class PluginSandboxController(
                     codespaceName = "",
                     recommendationTitle = recommendation.title,
                     status = SandboxStatus.LAUNCHING,
-                    summary = "Preparing a GitHub Codespaces sandbox for ${recommendation.title}.",
-                    commandPreview = recommendation.kind.commandPreview(recommendation.repositorySlug, state.sandboxConfig.branch),
+                    summary = "Preparing a launcher Codespace for ${recommendation.title}. The launcher environment will clone and boot the target repo automatically inside /workspaces/target.",
+                    commandPreview = codespacesService.commandPreview(state.sandboxConfig, recommendation),
                 ),
                 generatedPrompt = "",
                 scanResults = emptyList(),
@@ -114,17 +113,27 @@ class PluginSandboxController(
                                             "Validate the affected areas first: ${recommendation.affectedAreas.joinToString(", ")}."
                                         })
                                     },
-                                    commandPreview = "gh codespace ssh -c ${details.name}",
+                                    commandPreview = "Open browser sandbox for ${details.name}",
                                     browserUrl = details.webUrl,
                                 ),
+                                mcpBridge = mcpBridgeManager.info("AI chat MCP bridge is bound to ${details.name}."),
                                 lastError = "",
                             ),
                         )
                     }
                 }
+                mcpBridgeManager.writeActiveSandbox(
+                    codespaceName = details.name,
+                    repositoryName = "target",
+                    branch = details.branch,
+                    browserUrl = details.webUrl,
+                    recommendation = recommendation,
+                    workspacePath = "/workspaces/target",
+                )
                 scanOrchestrator.startScan(
                     codespaceName = details.name,
-                    repositoryName = details.repositoryName,
+                    workspacePath = "/workspaces/target",
+                    recommendation = recommendation,
                     onUpdate = { scanResults ->
                         setState(state.copy(scanResults = scanResults))
                     },
@@ -164,11 +173,15 @@ class PluginSandboxController(
     fun discardRecommendation(recommendationId: String) {
         val remaining = state.recommendations.filterNot { it.id == recommendationId }
         val clearSelection = state.selectedRecommendationId == recommendationId
+        if (clearSelection) {
+            mcpBridgeManager.clearActiveSandbox()
+        }
         setState(
             state.copy(
                 recommendations = remaining,
                 selectedRecommendationId = if (clearSelection) null else state.selectedRecommendationId,
                 sandboxSession = if (clearSelection) null else state.sandboxSession,
+                mcpBridge = if (clearSelection) mcpBridgeManager.info() else state.mcpBridge,
                 scanResults = if (clearSelection) emptyList() else state.scanResults,
                 generatedPrompt = if (clearSelection) "" else state.generatedPrompt,
             ),
@@ -176,9 +189,9 @@ class PluginSandboxController(
     }
 
     override fun dispose() {
-        sandboxReadyFuture?.cancel(false)
         activeSandboxTask?.cancel(true)
         scanOrchestrator.dispose()
+        mcpBridgeManager.clearActiveSandbox()
         listeners.clear()
     }
 
@@ -203,9 +216,4 @@ class PluginSandboxController(
         setState(state.copy(activityLog = nextLog))
     }
 
-    private fun com.hetpatel.pluginsandbox.model.RecommendationKind.commandPreview(repoSlug: String, branch: String): String = when (this) {
-        com.hetpatel.pluginsandbox.model.RecommendationKind.FAST_API_SIDECAR -> "gh codespace create -R $repoSlug" + if (branch.isNotBlank()) " -b $branch" else ""
-        com.hetpatel.pluginsandbox.model.RecommendationKind.DIRECT_IN_REPO -> "gh codespace create -R $repoSlug" + if (branch.isNotBlank()) " -b $branch" else ""
-        com.hetpatel.pluginsandbox.model.RecommendationKind.ADAPTER_SANDBOX -> "gh codespace create -R $repoSlug" + if (branch.isNotBlank()) " -b $branch" else ""
-    }
 }
