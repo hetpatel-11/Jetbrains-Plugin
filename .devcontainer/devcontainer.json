@@ -1,7 +1,7 @@
 {
   "name": "Ephemeral Sandbox",
   "image": "mcr.microsoft.com/devcontainers/python:3.10",
-  "postCreateCommand": "pip install fastapi uvicorn git",
+  "postCreateCommand": "pip install -q fastapi uvicorn flask django",
   "postStartCommand": "bash .devcontainer/start.sh",
   "forwardPorts": [8000],
   "portsAttributes": {

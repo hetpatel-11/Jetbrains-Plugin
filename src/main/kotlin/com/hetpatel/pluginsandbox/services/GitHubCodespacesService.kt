@@ -80,13 +80,16 @@ class GitHubCodespacesService(
         }
     }
 
+    private data class SshContext(val configPath: String, val host: String)
+    private val sshContextCache = java.util.concurrent.ConcurrentHashMap<String, SshContext>()
+
     fun runRemoteCommand(
         codespaceName: String,
         command: String,
         timeout: Duration = Duration.ofMinutes(15),
     ): CommandResult {
-        val sshConfig = Files.createTempFile("plugin-sandbox-codespace-", ".ssh")
-        return try {
+        val ctx = sshContextCache.getOrPut(codespaceName) {
+            val sshConfig = Files.createTempFile("plugin-sandbox-codespace-", ".ssh")
             val config = commandRunner.run(
                 listOf("gh", "codespace", "ssh", "-c", codespaceName, "--config"),
                 timeout = Duration.ofSeconds(30),
@@ -94,17 +97,16 @@ class GitHubCodespacesService(
             Files.writeString(sshConfig, config.stdout)
             val host = Regex("""(?m)^Host\s+(.+)$""").find(config.stdout)?.groupValues?.get(1)
                 ?: throw IllegalStateException("Failed to resolve SSH host alias for codespace $codespaceName.")
-            commandRunner.run(
-                listOf(
-                    "bash",
-                    "-lc",
-                    "ssh -F ${shellQuote(sshConfig.toString())} ${shellQuote(host)} bash -lc ${shellQuote(command)}",
-                ),
-                timeout = timeout,
-            )
-        } finally {
-            Files.deleteIfExists(sshConfig)
+            SshContext(configPath = sshConfig.toString(), host = host)
         }
+        return commandRunner.run(
+            listOf(
+                "bash",
+                "-lc",
+                "ssh -F ${shellQuote(ctx.configPath)} ${shellQuote(ctx.host)} bash -lc ${shellQuote(command)}",
+            ),
+            timeout = timeout,
+        )
     }
 
     private fun validateAuth(onLog: (String) -> Unit) {
@@ -398,126 +400,55 @@ class GitHubCodespacesService(
         codespaceName: String,
         recommendation: Recommendation,
     ): CommandResult {
-        val targetDevcontainerJson = """
-            {
-              "name": "Ephemeral Sandbox Target",
-              "image": "mcr.microsoft.com/devcontainers/python:3.10",
-              "postCreateCommand": "pip install fastapi uvicorn git",
-              "postStartCommand": "bash .devcontainer/start.sh",
-              "forwardPorts": [8000],
-              "portsAttributes": {
-                "8000": {
-                  "label": "Sandbox App",
-                  "onAutoForward": "openBrowser"
-                }
-              }
-            }
+        val targetRepo = shellQuote(recommendation.repositoryUrl)
+        val killPort = """
+            if command -v lsof >/dev/null 2>&1; then
+              pids="$(lsof -ti tcp:8000 || true)"
+              [ -n "${'$'}pids" ] && kill ${'$'}pids >/dev/null 2>&1 || true
+            fi
         """.trimIndent()
         val command = when (recommendation.kind) {
             RecommendationKind.FAST_API_SIDECAR -> """
                 set -e
-                rm -f /workspaces/Jetbrains-Plugin/devcontainer.txt
-                TARGET_REPO=${shellQuote(recommendation.repositoryUrl)}
                 TARGET_DIR=/workspaces/target
-                rm -rf "${'$'}TARGET_DIR"
-                git clone --depth 1 "${'$'}TARGET_REPO" "${'$'}TARGET_DIR"
-                rm -f "${'$'}TARGET_DIR/devcontainer.txt"
-                mkdir -p "${'$'}TARGET_DIR/.devcontainer"
-                cat > "${'$'}TARGET_DIR/.devcontainer/devcontainer.json" <<'JSON'
-                $targetDevcontainerJson
-                JSON
-                cat > "${'$'}TARGET_DIR/.devcontainer/start.sh" <<'SH'
-                #!/bin/bash
-                set -e
-                python -m pip install --upgrade pip
-                if [ -f requirements.txt ]; then
-                  pip install -r requirements.txt
-                else
-                  pip install fastapi uvicorn
+                if [ ! -d "${'$'}TARGET_DIR/.git" ]; then
+                  git clone --depth 1 $targetRepo "${'$'}TARGET_DIR"
                 fi
-                python -m uvicorn docs_src.body_updates.tutorial001_py310:app --host 0.0.0.0 --port 8000
-                SH
-                chmod +x "${'$'}TARGET_DIR/.devcontainer/start.sh"
                 cd "${'$'}TARGET_DIR"
-                if command -v lsof >/dev/null 2>&1; then
-                  pids="${'$'}(lsof -ti tcp:8000 || true)"
-                  if [ -n "${'$'}pids" ]; then
-                    kill ${'$'}pids >/dev/null 2>&1 || true
-                  fi
-                fi
-                nohup bash .devcontainer/start.sh >/tmp/plugin-sandbox-fastapi.log 2>&1 < /dev/null &
-                echo "Fallback bootstrap finished for FastAPI."
+                pip install -q fastapi uvicorn
+                $killPort
+                nohup python -m uvicorn docs_src.body_updates.tutorial001_py310:app --host 0.0.0.0 --port 8000 >/tmp/plugin-sandbox-fastapi.log 2>&1 &
+                echo "Fallback bootstrap finished for FastAPI (PID=${'$'}!)."
             """.trimIndent()
             RecommendationKind.DIRECT_IN_REPO -> """
                 set -e
-                rm -f /workspaces/Jetbrains-Plugin/devcontainer.txt
-                TARGET_REPO=${shellQuote(recommendation.repositoryUrl)}
                 TARGET_DIR=/workspaces/target
-                rm -rf "${'$'}TARGET_DIR"
-                git clone --depth 1 "${'$'}TARGET_REPO" "${'$'}TARGET_DIR"
-                rm -f "${'$'}TARGET_DIR/devcontainer.txt"
-                mkdir -p "${'$'}TARGET_DIR/.devcontainer"
-                cat > "${'$'}TARGET_DIR/.devcontainer/devcontainer.json" <<'JSON'
-                $targetDevcontainerJson
-                JSON
-                cat > "${'$'}TARGET_DIR/.devcontainer/start.sh" <<'SH'
-                #!/bin/bash
-                set -e
-                python -m pip install --upgrade pip
-                pip install -e .
-                pip install -e examples/tutorial
-                cd examples/tutorial
-                python -m flask --app flaskr init-db >/tmp/plugin-sandbox-flask-init.log 2>&1 || true
-                python -m flask --app flaskr run --host 0.0.0.0 --port 8000
-                SH
-                chmod +x "${'$'}TARGET_DIR/.devcontainer/start.sh"
-                cd "${'$'}TARGET_DIR"
-                if command -v lsof >/dev/null 2>&1; then
-                  pids="${'$'}(lsof -ti tcp:8000 || true)"
-                  if [ -n "${'$'}pids" ]; then
-                    kill ${'$'}pids >/dev/null 2>&1 || true
-                  fi
+                if [ ! -d "${'$'}TARGET_DIR/.git" ]; then
+                  git clone --depth 1 $targetRepo "${'$'}TARGET_DIR"
                 fi
-                nohup bash .devcontainer/start.sh >/tmp/plugin-sandbox-flask.log 2>&1 < /dev/null &
-                echo "Fallback bootstrap finished for Flask."
+                cd "${'$'}TARGET_DIR"
+                pip install -q -e . -e examples/tutorial
+                python -m flask --app examples/tutorial/flaskr init-db >/tmp/plugin-sandbox-flask-init.log 2>&1 || true
+                $killPort
+                nohup python -m flask --app examples/tutorial/flaskr run --host 0.0.0.0 --port 8000 >/tmp/plugin-sandbox-flask.log 2>&1 &
+                echo "Fallback bootstrap finished for Flask (PID=${'$'}!)."
             """.trimIndent()
             RecommendationKind.ADAPTER_SANDBOX -> """
                 set -e
-                rm -f /workspaces/Jetbrains-Plugin/devcontainer.txt
-                TARGET_REPO=${shellQuote(recommendation.repositoryUrl)}
                 TARGET_DIR=/workspaces/target
-                rm -rf "${'$'}TARGET_DIR"
-                git clone --depth 1 "${'$'}TARGET_REPO" "${'$'}TARGET_DIR"
-                rm -f "${'$'}TARGET_DIR/devcontainer.txt"
-                mkdir -p "${'$'}TARGET_DIR/.devcontainer"
-                cat > "${'$'}TARGET_DIR/.devcontainer/devcontainer.json" <<'JSON'
-                $targetDevcontainerJson
-                JSON
-                cat > "${'$'}TARGET_DIR/.devcontainer/start.sh" <<'SH'
-                #!/bin/bash
-                set -e
-                python -m pip install --upgrade pip
-                pip install -e .
-                TARGET_DIR="$(pwd)"
+                if [ ! -d "${'$'}TARGET_DIR/.git" ]; then
+                  git clone --depth 1 $targetRepo "${'$'}TARGET_DIR"
+                fi
+                cd "${'$'}TARGET_DIR"
+                pip install -q -e .
                 RUNTIME_DIR="${'$'}TARGET_DIR/.plugin-sandbox-runtime/django-demo"
                 mkdir -p "${'$'}RUNTIME_DIR"
-                if [ ! -f "${'$'}RUNTIME_DIR/manage.py" ]; then
-                  django-admin startproject sandbox_app "${'$'}RUNTIME_DIR"
-                fi
+                [ -f "${'$'}RUNTIME_DIR/manage.py" ] || django-admin startproject sandbox_app "${'$'}RUNTIME_DIR"
                 cd "${'$'}RUNTIME_DIR"
                 python manage.py migrate --noinput >/tmp/plugin-sandbox-django-migrate.log 2>&1
-                python manage.py runserver 0.0.0.0:8000
-                SH
-                chmod +x "${'$'}TARGET_DIR/.devcontainer/start.sh"
-                cd "${'$'}TARGET_DIR"
-                if command -v lsof >/dev/null 2>&1; then
-                  pids="${'$'}(lsof -ti tcp:8000 || true)"
-                  if [ -n "${'$'}pids" ]; then
-                    kill ${'$'}pids >/dev/null 2>&1 || true
-                  fi
-                fi
-                nohup bash .devcontainer/start.sh >/tmp/plugin-sandbox-django.log 2>&1 < /dev/null &
-                echo "Fallback bootstrap finished for Django."
+                $killPort
+                nohup python manage.py runserver 0.0.0.0:8000 >/tmp/plugin-sandbox-django.log 2>&1 &
+                echo "Fallback bootstrap finished for Django (PID=${'$'}!)."
             """.trimIndent()
         }
         return runRemoteCommand(codespaceName, command, timeout = Duration.ofMinutes(10))
