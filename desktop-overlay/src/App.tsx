@@ -34,13 +34,14 @@ interface GuidanceState {
   cursor: PendingClick | null
 }
 
+const OVERLAY_API = 'http://127.0.0.1:4546'
+
 declare global {
   interface Window {
     electronAPI: {
       onStateUpdate: (cb: (state: GuidanceState) => void) => () => void
       setInteractive: (interactive: boolean) => void
       getScreenSize: () => Promise<{ width: number; height: number }>
-      getState: () => Promise<GuidanceState>
       confirmClick: (confirmed: boolean) => void
     }
   }
@@ -63,25 +64,46 @@ export default function App() {
   const hoverCount = useRef(0)
   const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  const applyState = useCallback((nextState: GuidanceState) => {
+    setState(nextState)
+    if (nextState.pins.length > 0) {
+      setActivePinId((current) => current ?? nextState.pins[0].id)
+    }
+  }, [])
+
   // Subscribe to agent state updates from main process
   useEffect(() => {
-    if (!window.electronAPI) return
-    void window.electronAPI.getState().then((s) => {
-      setState(s)
-      if (s.pins.length > 0) {
-        setActivePinId((current) => current ?? s.pins[0].id)
-      }
-    })
+    let cancelled = false
 
-    const unsub = window.electronAPI.onStateUpdate((s) => {
-      setState(s)
-      // Auto-activate the first pin when agent pushes new ones
-      if (s.pins.length > 0) {
-        setActivePinId((current) => current ?? s.pins[0].id)
+    const syncState = async () => {
+      try {
+        const response = await fetch(`${OVERLAY_API}/api/state`)
+        if (!response.ok) {
+          throw new Error(`Overlay state request failed: ${response.status}`)
+        }
+        const nextState = (await response.json()) as GuidanceState
+        if (!cancelled) {
+          applyState(nextState)
+        }
+      } catch {
+        // Ignore transient API errors during app startup/shutdown.
       }
-    })
-    return unsub
-  }, [])
+    }
+
+    void syncState()
+
+    // Poll as a fallback. The transparent overlay window can miss pushed IPC
+    // updates during startup or hot reload. Polling the local overlay API keeps
+    // the visible cursor, pins, and message in sync with the main process.
+    const interval = window.setInterval(() => {
+      void syncState()
+    }, 120)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [applyState])
 
   // Track cursor position for coordinate picker mode
   useEffect(() => {
