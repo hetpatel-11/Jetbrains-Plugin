@@ -1,0 +1,148 @@
+## 🎯 Objective
+
+you are updating an existing kotlin program to autostart a repo cloned into codespaces.
+When a Codespace is started from this repo, it should:
+
+1. Automatically clone a target GitHub repository (default provided)
+2. Install dependencies inside that repo
+3. Run a predefined application (FastAPI demo for now)
+4. Expose the running app via a forwarded port (8000)
+5. Allow the user to interact with and modify the cloned repo
+
+The system must:
+
+* Run **fully automatically** on Codespace startup
+* Require **no manual terminal commands**
+* Allow overriding the target repo via an environment variable
+
+---
+
+## 🧠 Conceptual Model
+
+This repo is **not the app being tested**.
+
+It is a **launcher environment** that:
+
+* boots a Codespace
+* executes a startup script
+* dynamically clones and runs another repo inside it
+
+---
+
+## ⚙️ Execution Flow
+
+```text
+Codespace starts
+→ devcontainer initializes
+→ postCreateCommand installs base tools
+→ postStartCommand runs start.sh
+→ start.sh clones target repo
+→ installs dependencies
+→ runs application
+→ port is forwarded and opened
+```
+
+---
+
+## 📁 Required File Structure
+
+```
+.devcontainer/
+  devcontainer.json
+  start.sh
+```
+
+---
+
+## ⚙️ devcontainer.json
+
+```json
+{
+  "name": "Ephemeral Sandbox",
+  "image": "mcr.microsoft.com/devcontainers/python:3.10",
+
+  "postCreateCommand": "pip install fastapi uvicorn git",
+
+  "postStartCommand": "bash .devcontainer/start.sh",
+
+  "forwardPorts": [8000],
+
+  "portsAttributes": {
+    "8000": {
+      "label": "Sandbox App",
+      "onAutoForward": "openBrowser"
+    }
+  }
+}
+```
+
+---
+
+## 🚀 start.sh
+
+```bash
+#!/bin/bash
+set -e
+
+echo "🚀 Starting sandbox..."
+
+# Allow override via environment variable
+TARGET_REPO="${TARGET_REPO_URL:-https://github.com/fastapi/fastapi.git}"
+TARGET_DIR="/workspaces/target"
+
+echo "📥 Using repo: $TARGET_REPO"
+
+# Clone repo
+if [ ! -d "$TARGET_DIR" ]; then
+  git clone "$TARGET_REPO" "$TARGET_DIR"
+fi
+
+cd "$TARGET_DIR"
+
+echo "📦 Installing dependencies..."
+
+if [ -f requirements.txt ]; then
+  pip install -r requirements.txt
+else
+  pip install fastapi uvicorn
+fi
+
+echo "🔥 Launching app..."
+
+python -m uvicorn docs_src.body_updates.tutorial001_py310:app --host 0.0.0.0 --port 8000 || {
+  echo "❌ Failed to start app. Keeping container alive for debugging..."
+  sleep 300
+}
+```
+
+---
+
+## ⚠️ Required Setup Step
+
+Make the script executable:
+
+```bash
+chmod +x .devcontainer/start.sh
+```
+
+---
+
+## 🧪 Expected Behavior
+
+After launching a Codespace:
+
+* Target repo is cloned into `/workspaces/target`
+* Dependencies are installed automatically
+* FastAPI server starts automatically
+* Port 8000 is forwarded and opened in browser
+* User can explore and modify the cloned repo
+
+---
+
+## 🔄 Future Extension (Do NOT implement yet)
+
+* Replace hardcoded run command with dynamic execution logic
+* Support multiple languages and frameworks
+* Inject install/run commands from backend system
+
+---
