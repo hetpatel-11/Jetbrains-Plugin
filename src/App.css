@@ -100,6 +100,10 @@
   color: var(--text-soft);
 }
 
+.panel-note.is-error {
+  color: #a3431e;
+}
+
 .button {
   border: 1px solid var(--border);
   background: var(--button);
